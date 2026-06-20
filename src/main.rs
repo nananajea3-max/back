@@ -2,27 +2,29 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use axum::http::{Method, header, HeaderValue};
 use sqlx::mysql::MySqlPoolOptions;
 use std::env;
-use tower_http::cors::{Any, CorsLayer};
-use axum::http::Method;
+use tower_http::{
+    cors::{Any, CorsLayer},
+    set_header::SetResponseHeaderLayer,
+};
 
-// Memanggil file super_admin.rs yang telah Anda buat sebelumnya
+// Modul endpoint super admin
 mod super_admin; 
 
 #[tokio::main]
 async fn main() {
-    // Render menggunakan env var PORT secara dinamis. Default 8000 untuk lokal.
     let port = env::var("PORT").unwrap_or_else(|_| "8000".to_string());
     let addr = format!("0.0.0.0:{}", port);
 
-    // MENGAMBIL KONEKSI DATABASE KHUSUS SUPER ADMIN
     let db_url = env::var("DATABASE_URL")
-        .expect("⚠️ FATAL: DATABASE_URL (TiDB db_superadmin) belum dimasukkan di Environment Variables Render!");
+        .expect("⚠️ FATAL: DATABASE_URL belum diatur!");
 
-    println!("🔄 Menghubungkan ke Bank Sentral (TiDB db_superadmin)...");
+    println!("🔄 Menghubungkan ke Bank Sentral (TiDB)...");
     
-    // Konfigurasi koneksi (Dibatasi maks 10 koneksi agar Render Gratis tidak OOM/Tumbang)
+    // [Mitigasi #50, #80: OOM Attack & Thread Exhaustion]
+    // Membatasi koneksi maksimal untuk menghindari kehabisan memori server Render
     let pool = MySqlPoolOptions::new()
         .max_connections(10)
         .connect(&db_url)
@@ -31,21 +33,33 @@ async fn main() {
         
     println!("✅ Terhubung ke Bank Sentral!");
 
-    // 🛡️ SECURITY: Konfigurasi CORS 
+    // [Mitigasi #20: CORS Misconfiguration]
+    // Saat produksi, ganti 'Any' dengan URL spesifik Vercel Anda
     let cors = CorsLayer::new()
-        .allow_origin(Any) // Saat Live, ubah "Any" dengan domain Vercel Super Admin Anda
+        .allow_origin(Any) 
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(Any);
 
-    // =========================================================================
-    // 🚦 ROUTER KHUSUS SUPER ADMIN (Tertutup & Terisolasi)
-    // =========================================================================
+    // [Mitigasi #3, #39, #92: Clickjacking, MIME Sniffing, XS-Leaks]
+    // Menerapkan Security Headers secara global pada aplikasi
     let app = Router::new()
+        .route("/api/super/login", post(super_admin::login))
         .route("/api/super/balances", get(super_admin::get_all_tenant_balances))
         .route("/api/super/withdrawals", get(super_admin::get_all_withdrawals))
         .route("/api/super/withdrawals/:id/approve", post(super_admin::approve_withdrawal))
-        .route("/api/super/tenants", post(super_admin::register_tenant_manual))
         .layer(cors)
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        ))
         .with_state(pool);
 
     println!("🚀 Server Pusat Bakoel Super Admin berjalan di {}", addr);
