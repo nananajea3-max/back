@@ -209,3 +209,99 @@ pub async fn approve_withdrawal(
 
     success_response(json!({"message": "Transfer Sukses!"}))
 }
+// =========================================================================
+// API 5: AMBIL DETAIL PROFIL TENANT BESERTA RIWAYATNYA
+// =========================================================================
+pub async fn get_tenant_detail(
+    State(pool): State<MySqlPool>,
+    headers: HeaderMap,
+    Path(tenant_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = verify_super_admin(&headers) { return e; }
+
+    let safe_id = tenant_id.replace(|c: char| !c.is_alphanumeric() && c != '-', "");
+
+    // Ambil data identitas
+    let query_tenant = "SELECT * FROM tenants WHERE id = ?";
+    let tenant_row = match sqlx::query(query_tenant).bind(&safe_id).fetch_optional(&pool).await {
+        Ok(Some(row)) => row,
+        _ => return error_response(StatusCode::NOT_FOUND, "Tenant tidak ditemukan."),
+    };
+
+    // Ambil riwayat penarikan
+    let query_wd = "SELECT id, CAST(nominal AS CHAR) as nominal, status, waktu_pengajuan FROM ledger_out WHERE tenant_id = ? ORDER BY waktu_pengajuan DESC LIMIT 50";
+    let wds = sqlx::query(query_wd).bind(&safe_id).fetch_all(&pool).await.unwrap_or_default();
+    
+    let mut riwayat_penarikan = Vec::new();
+    for w in wds {
+        riwayat_penarikan.push(json!({
+            "id": w.try_get::<String, _>("id").unwrap_or_default(),
+            "nominal": w.try_get::<String, _>("nominal").unwrap_or_default().parse::<f64>().unwrap_or(0.0),
+            "status": w.try_get::<String, _>("status").unwrap_or_default(),
+            "waktu": w.try_get::<String, _>("waktu_pengajuan").unwrap_or_default()
+        }));
+    }
+
+    // Ambil snapshot pemasukan terakhir (Sebagai riwayat masuk)
+    let query_income = "SELECT CAST(total_pemasukan AS CHAR) as total, terakhir_sinkron FROM tenant_incomes WHERE tenant_id = ?";
+    let income_row = sqlx::query(query_income).bind(&safe_id).fetch_optional(&pool).await.unwrap_or_default();
+    
+    let (total_masuk, terakhir_sinkron) = match income_row {
+        Some(row) => (
+            row.try_get::<String, _>("total").unwrap_or_default().parse::<f64>().unwrap_or(0.0),
+            row.try_get::<String, _>("terakhir_sinkron").unwrap_or_default()
+        ),
+        None => (0.0, String::from("Belum ada data")),
+    };
+
+    success_response(json!({
+        "profil": {
+            "id": tenant_row.try_get::<String, _>("id").unwrap_or_default(),
+            "nama_toko": tenant_row.try_get::<String, _>("nama_toko").unwrap_or_default(),
+            "nama_pemilik": tenant_row.try_get::<String, _>("nama_pemilik").unwrap_or_default(),
+            "nomor_wa": tenant_row.try_get::<String, _>("nomor_wa").unwrap_or_default(),
+            "email": tenant_row.try_get::<String, _>("email").unwrap_or_default(),
+            "alamat": tenant_row.try_get::<String, _>("alamat_penjemputan").unwrap_or_default(),
+            "no_ktp": tenant_row.try_get::<String, _>("no_ktp").unwrap_or_default(),
+            "no_npwp": tenant_row.try_get::<String, _>("no_npwp").unwrap_or_default(),
+            "bank_nama": tenant_row.try_get::<String, _>("bank_nama").unwrap_or_default(),
+            "bank_rekening": tenant_row.try_get::<String, _>("bank_rekening").unwrap_or_default(),
+            "bank_atas_nama": tenant_row.try_get::<String, _>("bank_atas_nama").unwrap_or_default(),
+        },
+        "keuangan": {
+            "total_masuk": total_masuk,
+            "terakhir_sinkron_masuk": terakhir_sinkron,
+            "riwayat_penarikan": riwayat_penarikan
+        }
+    }))
+}
+
+// =========================================================================
+// API 6: UPDATE KYC (KTP & NPWP) OLEH SUPER ADMIN
+// =========================================================================
+#[derive(Deserialize)]
+pub struct UpdateKycPayload {
+    pub no_ktp: String,
+    pub no_npwp: String,
+}
+
+pub async fn update_tenant_kyc(
+    State(pool): State<MySqlPool>,
+    headers: HeaderMap,
+    Path(tenant_id): Path<String>,
+    Json(payload): Json<UpdateKycPayload>,
+) -> impl IntoResponse {
+    if let Err(e) = verify_super_admin(&headers) { return e; }
+    
+    let safe_id = tenant_id.replace(|c: char| !c.is_alphanumeric() && c != '-', "");
+
+    // Sanitasi input
+    let ktp = payload.no_ktp.trim();
+    let npwp = payload.no_npwp.trim();
+
+    let query = "UPDATE tenants SET no_ktp = ?, no_npwp = ? WHERE id = ?";
+    match sqlx::query(query).bind(ktp).bind(npwp).bind(&safe_id).execute(&pool).await {
+        Ok(_) => success_response(json!({"message": "Data KYC (KTP & NPWP) berhasil disimpan!"})),
+        Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "Gagal menyimpan data KYC."),
+    }
+}
