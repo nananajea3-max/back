@@ -1,5 +1,5 @@
 use axum::{
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use axum::http::{Method, header, HeaderValue};
@@ -47,6 +47,8 @@ async fn main() {
         .route("/api/super/balances", get(super_admin::get_all_tenant_balances))
         .route("/api/super/withdrawals", get(super_admin::get_all_withdrawals))
         .route("/api/super/withdrawals/:id/approve", post(super_admin::approve_withdrawal))
+        .route("/api/super/tenants/:id", get(super_admin::get_tenant_detail))
+        .route("/api/super/tenants/:id/kyc", put(super_admin::update_tenant_kyc))
         .layer(cors)
         .layer(SetResponseHeaderLayer::overriding(
             header::X_CONTENT_TYPE_OPTIONS,
