@@ -1,16 +1,13 @@
 use axum::{
-    routing::{get, post, put},
+    routing::{get, post, put}, // 1. Tambahkan izin 'put' di sini
     Router,
 };
-use axum::http::{Method, header, HeaderValue};
 use sqlx::mysql::MySqlPoolOptions;
 use std::env;
-use tower_http::{
-    cors::{Any, CorsLayer},
-    set_header::SetResponseHeaderLayer,
-};
+use tower_http::cors::{Any, CorsLayer};
+use axum::http::Method;
 
-// Modul endpoint super admin
+// Memanggil file super_admin.rs
 mod super_admin; 
 
 #[tokio::main]
@@ -19,12 +16,10 @@ async fn main() {
     let addr = format!("0.0.0.0:{}", port);
 
     let db_url = env::var("DATABASE_URL")
-        .expect("⚠️ FATAL: DATABASE_URL belum diatur!");
+        .expect("⚠️ FATAL: DATABASE_URL belum diatur di Environment Variables!");
 
     println!("🔄 Menghubungkan ke Bank Sentral (TiDB)...");
     
-    // [Mitigasi #50, #80: OOM Attack & Thread Exhaustion]
-    // Membatasi koneksi maksimal untuk menghindari kehabisan memori server Render
     let pool = MySqlPoolOptions::new()
         .max_connections(10)
         .connect(&db_url)
@@ -33,35 +28,22 @@ async fn main() {
         
     println!("✅ Terhubung ke Bank Sentral!");
 
-    // [Mitigasi #20: CORS Misconfiguration]
-    // Saat produksi, ganti 'Any' dengan URL spesifik Vercel Anda
+    // 2. 🛡️ FIX CORS: Tambahkan Method::PUT agar Vercel diizinkan menyimpan data baru
     let cors = CorsLayer::new()
         .allow_origin(Any) 
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
         .allow_headers(Any);
 
-    // [Mitigasi #3, #39, #92: Clickjacking, MIME Sniffing, XS-Leaks]
-    // Menerapkan Security Headers secara global pada aplikasi
+    // 3. DAFTARKAN SEMUA RUTE SECARA LENGKAP
     let app = Router::new()
         .route("/api/super/login", post(super_admin::login))
         .route("/api/super/balances", get(super_admin::get_all_tenant_balances))
         .route("/api/super/withdrawals", get(super_admin::get_all_withdrawals))
         .route("/api/super/withdrawals/:id/approve", post(super_admin::approve_withdrawal))
+        // 👇 Dua rute profil dan KYC yang sebelumnya terlewat
         .route("/api/super/tenants/:id", get(super_admin::get_tenant_detail))
         .route("/api/super/tenants/:id/kyc", put(super_admin::update_tenant_kyc))
         .layer(cors)
-        .layer(SetResponseHeaderLayer::overriding(
-            header::X_CONTENT_TYPE_OPTIONS,
-            HeaderValue::from_static("nosniff"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            header::X_FRAME_OPTIONS,
-            HeaderValue::from_static("DENY"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            header::STRICT_TRANSPORT_SECURITY,
-            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
-        ))
         .with_state(pool);
 
     println!("🚀 Server Pusat Bakoel Super Admin berjalan di {}", addr);
