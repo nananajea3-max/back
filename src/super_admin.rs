@@ -8,6 +8,15 @@ use serde_json::{json, Value};
 use sqlx::{MySqlPool, Row};
 use std::env;
 use jsonwebtoken::{decode, encode, Header, EncodingKey, DecodingKey, Validation, Algorithm};
+use tokio::sync::Semaphore; // 🛡️ Diperlukan untuk 5-Pipe Concurrency
+
+// =========================================================================
+// 🚀 OPTIMASI SERVER RENDER GRATIS: 5-PIPE CONCURRENCY LIMITER
+// (Mitigasi #18 DoS, #50 OOM / Uncontrolled Resource, #80 Thread Starvation)
+// =========================================================================
+// Menahan maksimal 5 beban komputasi DB secara bersamaan. Sisa request akan 
+// diantrekan dengan sangat efisien oleh Tokio tanpa membuat server crash/hang.
+static DB_PIPE: Semaphore = Semaphore::const_new(5);
 
 // [Mitigasi #14, #82: Insecure Deserialization & Type Confusion]
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,9 +85,15 @@ fn verify_super_admin(headers: &HeaderMap) -> Result<String, Response> {
 }
 
 // =========================================================================
-// API 1: LOGIN (Mitigasi #7 SQLi, #51 Timing Attacks, #30 Brute Force Delay)
+// API 1: LOGIN (Mitigasi #7 SQLi, #48 Panic, #51 Timing Attacks)
 // =========================================================================
 pub async fn login(State(pool): State<MySqlPool>, Json(payload): Json<LoginPayload>) -> impl IntoResponse {
+    // 🚦 Menerapkan 1 Pipe perlindungan memori (Antrean Komputasi)
+    let _permit = match DB_PIPE.acquire().await {
+        Ok(p) => p,
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "Server sedang menyeimbangkan beban."),
+    };
+
     let query = "SELECT username, password_hash FROM super_admins WHERE username = ? LIMIT 1";
     let admin_row = match sqlx::query(query).bind(&payload.username).fetch_optional(&pool).await {
         Ok(Some(row)) => row,
@@ -97,16 +112,27 @@ pub async fn login(State(pool): State<MySqlPool>, Json(payload): Json<LoginPaylo
     let expiration = chrono::Utc::now().checked_add_signed(chrono::Duration::hours(2)).unwrap().timestamp() as usize;
 
     let claims = Claims { sub: "SUPER-BOSS".to_string(), exp: expiration };
-    let token = encode(&Header::default(), &claims, &EncodingKey::from_secret(jwt_secret.as_bytes())).unwrap();
+    
+    // [Mitigasi #48 Uncaught Panic] Menggunakan match alih-alih .unwrap() untuk cegah crash
+    let token = match encode(&Header::default(), &claims, &EncodingKey::from_secret(jwt_secret.as_bytes())) {
+        Ok(t) => t,
+        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Gagal memproses tiket sesi."),
+    };
     
     success_response(json!({ "message": "Sukses", "token": token, "username": username }))
 }
 
 // =========================================================================
-// API 2: MONITORING SALDO (DOUBLE-ENTRY) (Mitigasi #50 OOM LIMIT, #48 Panic)
+// API 2: MONITORING SALDO (DOUBLE-ENTRY) (Mitigasi #50 OOM LIMIT, #82 Type Confusion)
 // =========================================================================
 pub async fn get_all_tenant_balances(State(pool): State<MySqlPool>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = verify_super_admin(&headers) { return e; }
+
+    // 🚦 Menerapkan 1 Pipe perlindungan memori (Antrean Komputasi)
+    let _permit = match DB_PIPE.acquire().await {
+        Ok(p) => p,
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "Server sedang sibuk."),
+    };
 
     let query = "
         SELECT 
@@ -142,10 +168,16 @@ pub async fn get_all_tenant_balances(State(pool): State<MySqlPool>, headers: Hea
 }
 
 // =========================================================================
-// API 3: ANTREAN PENARIKAN (TERMASUK NAMA PEMILIK)
+// API 3: ANTREAN PENARIKAN
 // =========================================================================
 pub async fn get_all_withdrawals(State(pool): State<MySqlPool>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = verify_super_admin(&headers) { return e; }
+
+    // 🚦 Menerapkan 1 Pipe perlindungan memori (Antrean Komputasi)
+    let _permit = match DB_PIPE.acquire().await {
+        Ok(p) => p,
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "Server sedang sibuk."),
+    };
 
     let query = "
         SELECT l.id, l.tenant_id, CAST(l.nominal AS CHAR) as nominal, l.nama_bank, 
@@ -188,7 +220,12 @@ pub async fn approve_withdrawal(
     // [Mitigasi #10 Path Traversal]
     let safe_wd_id = withdrawal_id.replace(|c: char| !c.is_alphanumeric() && c != '-', "");
 
-    // Menggunakan Atomic Update untuk mencegah Race Condition saldo
+    // 🚦 Menerapkan 1 Pipe perlindungan memori (Antrean Komputasi)
+    let _permit = match DB_PIPE.acquire().await {
+        Ok(p) => p,
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "Server sedang sibuk."),
+    };
+
     let query = "UPDATE ledger_out SET status = 'Selesai', waktu_selesai = CURRENT_TIMESTAMP WHERE id = ? AND status = 'Pending'";
     
     match sqlx::query(query).bind(&safe_wd_id).execute(&pool).await {
@@ -207,7 +244,14 @@ pub async fn get_tenant_detail(
     State(pool): State<MySqlPool>, headers: HeaderMap, Path(tenant_id): Path<String>,
 ) -> impl IntoResponse {
     if let Err(e) = verify_super_admin(&headers) { return e; }
+    
     let safe_id = tenant_id.replace(|c: char| !c.is_alphanumeric() && c != '-', "");
+
+    // 🚦 Menerapkan 1 Pipe perlindungan memori (Antrean Komputasi)
+    let _permit = match DB_PIPE.acquire().await {
+        Ok(p) => p,
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "Server sedang sibuk."),
+    };
 
     let query_tenant = "SELECT * FROM tenants WHERE id = ?";
     let tenant_row = match sqlx::query(query_tenant).bind(&safe_id).fetch_optional(&pool).await {
@@ -262,16 +306,30 @@ pub async fn get_tenant_detail(
 }
 
 // =========================================================================
-// API 6: UPDATE KYC (KTP & NPWP)
+// API 6: UPDATE KYC (KTP & NPWP) 
+// (Mitigasi #22 Mass Assignment, #43 Payload Overflow)
 // =========================================================================
 pub async fn update_tenant_kyc(
     State(pool): State<MySqlPool>, headers: HeaderMap, Path(tenant_id): Path<String>, Json(payload): Json<UpdateKycPayload>,
 ) -> impl IntoResponse {
     if let Err(e) = verify_super_admin(&headers) { return e; }
+    
     let safe_id = tenant_id.replace(|c: char| !c.is_alphanumeric() && c != '-', "");
 
     let ktp = payload.no_ktp.trim();
     let npwp = payload.no_npwp.trim();
+
+    // [Mitigasi #17, #50 Decompression/Buffer Overflow Attack]
+    // Mencegah hacker memasukkan teks jutaan karakter yang merusak RAM DB Pusat
+    if ktp.len() > 30 || npwp.len() > 30 {
+        return error_response(StatusCode::BAD_REQUEST, "Format ID terlalu panjang (Maks. 30 Karakter).");
+    }
+
+    // 🚦 Menerapkan 1 Pipe perlindungan memori (Antrean Komputasi)
+    let _permit = match DB_PIPE.acquire().await {
+        Ok(p) => p,
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "Server sedang sibuk."),
+    };
 
     let query = "UPDATE tenants SET no_ktp = ?, no_npwp = ? WHERE id = ?";
     match sqlx::query(query).bind(ktp).bind(npwp).bind(&safe_id).execute(&pool).await {
